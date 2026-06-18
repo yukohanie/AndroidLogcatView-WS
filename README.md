@@ -3,7 +3,7 @@
 
 A tool to view logcat in your browser powered by Go and NextJS
 
-[![license](https://img.shields.io/github/license/yukohanie/AndroidLogView-WS)](./LICENSE)
+[![license](https://img.shields.io/github/license/yukohanie/AndroidLogcatView-WS)](./LICENSE)
 
 # Features
 - Stream your logcat live to the internet in real time.
