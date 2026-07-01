@@ -57,8 +57,7 @@ export function FilterLogs(logs: LogEntry[], options: FilterOptions): LogEntry[]
         };
 
         const mappedLevel = levelMap[levelKey] || levelKey;
-        return !(!levels[mappedLevel] || !levels[levelKey]);
-
+        return Boolean(levels[mappedLevel] ?? levels[levelKey]);
     });
 
     const queryTrimmed = query.trim()

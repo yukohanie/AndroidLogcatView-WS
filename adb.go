@@ -3,9 +3,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"embed"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -235,11 +235,20 @@ func (a *AdbManager) ListPackages(deviceId string) ([]string, error) {
 	return packages, nil
 }
 
-func (a *AdbManager) StreamLogcat(deviceId string) (<-chan LogEntry, <-chan error, error) {
-	cmd := exec.Command(a.adbPath, "-s", deviceId, "logcat", "-v", "threadtime")
-	cmd.Env = append(os.Environ(), "ANDROID_ADB_SERVER_PORT=5037")
-	stdout, err := cmd.StdoutPipe()
+func (a *AdbManager) StreamLogcat(ctx context.Context, deviceId string) (<-chan LogEntry, <-chan error, error) {
+	deviceId = strings.TrimSpace(deviceId)
+	if deviceId == "" {
+		return nil, nil, fmt.Errorf("missing device id")
+	}
 
+	cmd := exec.CommandContext(ctx, a.adbPath, "-s", deviceId, "logcat", "-v", "threadtime")
+	cmd.Env = append(os.Environ(), "ANDROID_ADB_SERVER_PORT=5037")
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -249,23 +258,63 @@ func (a *AdbManager) StreamLogcat(deviceId string) (<-chan LogEntry, <-chan erro
 	}
 
 	logChan := make(chan LogEntry, 100)
-	errChan := make(chan error, 1)
+	errChan := make(chan error, 4)
+
+	var streamWg sync.WaitGroup
+	var errMu sync.Mutex
+	errChanClosed := false
+	sendErr := func(err error) {
+		if err == nil || err == context.Canceled {
+			return
+		}
+		errMu.Lock()
+		defer errMu.Unlock()
+		if errChanClosed {
+			return
+		}
+		select {
+		case errChan <- err:
+		default:
+		}
+	}
 
 	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+
+		a.UpdatePidMap(deviceId)
 		for {
-			a.UpdatePidMap(deviceId)
-			time.Sleep(3 * time.Second)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.UpdatePidMap(deviceId)
+			}
 		}
 	}()
 
+	streamWg.Add(1)
+
 	go func() {
-		defer func(stdout io.ReadCloser) {
-			err := stdout.Close()
-			if err != nil {
-				panic(err)
+		defer streamWg.Done()
+		scanner := bufio.NewScanner(stderr)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			msg := strings.TrimSpace(scanner.Text())
+			if msg != "" {
+				sendErr(fmt.Errorf("adb logcat stderr: %s", msg))
 			}
-		}(stdout)
+		}
+		sendErr(scanner.Err())
+	}()
+
+	streamWg.Add(1)
+
+	go func() {
+		defer streamWg.Done()
+		defer close(logChan)
 		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		var lastEntry *LogEntry
 
 		for scanner.Scan() {
@@ -280,16 +329,26 @@ func (a *AdbManager) StreamLogcat(deviceId string) (<-chan LogEntry, <-chan erro
 
 			if entry != nil {
 				lastEntry = entry
-				logChan <- *entry
+				select {
+				case logChan <- *entry:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 
-		if err := scanner.Err(); err != nil {
-			errChan <- err
+		sendErr(scanner.Err())
+	}()
+
+	go func() {
+		streamWg.Wait()
+		if err := cmd.Wait(); err != nil && ctx.Err() == nil {
+			sendErr(err)
 		}
-		close(logChan)
+		errMu.Lock()
+		errChanClosed = true
 		close(errChan)
-		_ = cmd.Process.Kill()
+		errMu.Unlock()
 	}()
 
 	return logChan, errChan, nil

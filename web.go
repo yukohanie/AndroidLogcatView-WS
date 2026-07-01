@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -99,7 +100,11 @@ func killAdbHandler(adb *AdbManager) http.HandlerFunc {
 
 func wsHandler(adb *AdbManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		deviceId := r.URL.Query().Get("device")
+		deviceId := strings.TrimSpace(r.URL.Query().Get("device"))
+		if deviceId == "" {
+			http.Error(w, "Missing device id", http.StatusBadRequest)
+			return
+		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			fmt.Printf("[ERROR] Upgrade: %v\n", err)
@@ -110,7 +115,10 @@ func wsHandler(adb *AdbManager) http.HandlerFunc {
 		defer func(conn *websocket.Conn) {
 			_ = conn.Close()
 		}(conn)
-		logChan, errChan, err := adb.StreamLogcat(deviceId)
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+
+		logChan, errChan, err := adb.StreamLogcat(ctx, deviceId)
 		if err != nil {
 			errPayload, _ := json.Marshal(map[string]string{"error": err.Error()})
 			_ = conn.WriteMessage(websocket.TextMessage, errPayload)
@@ -119,9 +127,10 @@ func wsHandler(adb *AdbManager) http.HandlerFunc {
 
 		clientDisconnect := make(chan struct{})
 		go func() {
+			defer close(clientDisconnect)
 			for {
 				if _, _, err := conn.ReadMessage(); err != nil {
-					close(clientDisconnect)
+					cancel()
 					return
 				}
 			}
@@ -138,9 +147,15 @@ func wsHandler(adb *AdbManager) http.HandlerFunc {
 					continue
 				}
 				if err := conn.WriteMessage(websocket.TextMessage, jsonMsg); err != nil {
+					cancel()
 					return
 				}
-			case <-errChan:
+			case err, ok := <-errChan:
+				if ok && err != nil {
+					fmt.Printf("[ERROR] StreamLogcat(%s): %v\n", deviceId, err)
+					errPayload, _ := json.Marshal(map[string]string{"error": err.Error()})
+					_ = conn.WriteMessage(websocket.TextMessage, errPayload)
+				}
 				return
 			case <-clientDisconnect:
 				return
